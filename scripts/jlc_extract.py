@@ -90,79 +90,271 @@ def strip_logo_decals(shape, colors):
     return Part.makeCompound(keep_solids), keep_cols, len(dropped_labels)
 
 
-def strip_engraved_text(shape, colors):
-    """抹掉 EasyEDA 刻在本体表面的「型号/封装名字」(如 SOIC16)。
+def count_blocks(boxes, gap=0.01):
+    """把 XY 包围盒按「间隙 <= gap 就相邻」合并，返回独立块数。"""
+    bs = [[b[0] - gap, b[1] + gap, b[2] - gap, b[3] + gap] for b in boxes]
+    merged = True
+    while merged:
+        merged = False
+        for a in range(len(bs)):
+            for b in range(a + 1, len(bs)):
+                A, B = bs[a], bs[b]
+                if (A[0] <= B[1] and B[0] <= A[1]
+                        and A[2] <= B[3] and B[2] <= A[3]):
+                    A[0], A[1] = min(A[0], B[0]), max(A[1], B[1])
+                    A[2], A[3] = min(A[2], B[2]), max(A[3], B[3])
+                    bs.pop(b)
+                    merged = True
+                    break
+            if merged:
+                break
+    return len(bs)
 
-    这种字是直接刻进本体的凹槽(深约 0.01mm)，不是独立薄片，删不掉也不能布尔补面。
-    但它之所以看得见，只是因为槽壁/槽底被上了亮色 —— 把这几片面的颜色改成
-    本体主色，字就「隐形」了(几何仍在，深度 10µm，渲染/打印无影响)。
-    判据: 位于外壳顶面/底面的 0.03mm 薄层内 + 比本体亮(每通道>=0.6) + 在 XY 上
-    分成 >=4 个独立小块(文字特征) → 判为文字 → 改色。
-    单片特征(例如 1 脚标记)不动。
+
+def strip_surface_marks(shape, colors):
+    """抹掉 EasyEDA 打/刻在器件外表面上的水印 logo(LCEDA/EasyEDA)与型号刻字。
+
+    实现思路分两步，互补覆盖两类模型：
+    1) 全局聚类：先用大面面积定出「本体主色」(通常是暗灰/黑)，然后把所有
+       小面积、高亮度(>=0.7)、颜色不同于本体的碎面按 XY  proximity 聚类。
+       聚成 >=5 片、总面积 >=0.01mm² 的簇就是水印/型号字 → 改成本体色。
+       这能处理 PDIP/SOIC 等「本体一个 solid、顶面圆润，水印被切成百片小白面」
+       的情况（旧版按 Z 薄层找主色会失效）。
+    2) 局部薄层：对扁平器件顶面，仍保留原来的「最外 30µm 薄层 + 局部主色」
+       逻辑作为兜底，防止 R2512 这类内部有大块隐形容器把全局主色带偏的情况。
+
+    1 脚标记通常只有 1~4 个小块，不会进入 >=5 的簇；金属大面因面积大也不参与。
+    命中只改颜色不改几何，因为有的刻字是凹进本体的，删面会破坏 solid。
     """
     faces = shape.Faces
     n = len(faces)
     if len(colors) != n or n == 0:
         return colors, 0
 
-    area_by_col = {}
-    for i, f in enumerate(faces):
-        c = tuple(round(x, 3) for x in colors[i][:3])
-        area_by_col[c] = area_by_col.get(c, 0.0) + f.Area
-    body = max(area_by_col.items(), key=lambda kv: kv[1])[0]
+    def ckey(c):
+        return tuple(round(x, 3) for x in c[:3])
 
     bb = shape.BoundBox
-    slab = bb.ZMax
-    hits = []
-    while True:
-        cand = []
+    new_cols = list(colors)
+    hits_total = 0
+
+    # ------------------------------------------------------------------
+    # 1) 全局聚类（处理 PDIP/SOIC 等圆润顶面）
+    # ------------------------------------------------------------------
+    # 本体主色：面积大、且不太亮（排除金属/水印）的面中占多数的颜色
+    body_color = None
+    area_by_col = {}
+    body_xmin = body_xmax = body_ymin = body_ymax = None
+    for i, f in enumerate(faces):
+        c = colors[i]
+        ck = ckey(c)
+        if min(c) >= 0.7:       # 高亮面很可能是金属/水印，不当成本体候选
+            continue
+        if f.Area < 0.005:
+            continue
+        area_by_col[ck] = area_by_col.get(ck, 0.0) + f.Area
+        # 同步用「大且暗」的面估算本体 XY  footprint，排除引脚末端
+        if f.Area >= 0.05:
+            fb = f.BoundBox
+            if body_xmin is None:
+                body_xmin, body_xmax = fb.XMin, fb.XMax
+                body_ymin, body_ymax = fb.YMin, fb.YMax
+            else:
+                body_xmin = min(body_xmin, fb.XMin)
+                body_xmax = max(body_xmax, fb.XMax)
+                body_ymin = min(body_ymin, fb.YMin)
+                body_ymax = max(body_ymax, fb.YMax)
+    if area_by_col:
+        body_color = max(area_by_col.items(), key=lambda kv: kv[1])[0]
+    else:
+        # 兜底：取最大单个面颜色
+        i = max(range(n), key=lambda j: faces[j].Area)
+        body_color = ckey(colors[i])
+    if body_xmin is None:
+        body_xmin, body_xmax = bb.XMin, bb.XMax
+        body_ymin, body_ymax = bb.YMin, bb.YMax
+    else:
+        margin = 0.15
+        body_xmin -= margin
+        body_xmax += margin
+        body_ymin -= margin
+        body_ymax += margin
+
+    def in_footprint(i):
+        fb = faces[i].BoundBox
+        cx = (fb.XMin + fb.XMax) * 0.5
+        cy = (fb.YMin + fb.YMax) * 0.5
+        return (body_xmin <= cx <= body_xmax and body_ymin <= cy <= body_ymax)
+
+    # 候选面：小、亮、颜色不同于本体、Z 向薄、在本体 footprint 内、且靠近顶面。
+    # 嘉立创 LCEDA/EasyEDA 水印只打在本体顶面；底面大金属散热焊盘不处理。
+    z_top = bb.ZMax - 0.10
+    small_cands = []
+    for i, f in enumerate(faces):
+        c = colors[i]
+        if ckey(c) == body_color:
+            continue
+        if min(c) < 0.7:
+            continue
+        if f.Area > 0.05:
+            continue
+        if f.BoundBox.ZLength > 0.05:
+            continue
+        if f.BoundBox.ZMax < z_top:
+            continue
+        if not in_footprint(i):
+            continue
+        small_cands.append(i)
+
+    if len(small_cands) >= 5:
+        gap = 0.25  # 同一字母/图标的相邻小面间距一般不超过 0.25mm
+        used = set()
+        clusters = []
+        for i in small_cands:
+            if i in used:
+                continue
+            cluster = [i]
+            used.add(i)
+            queue = [i]
+            while queue:
+                cur = queue.pop(0)
+                cbb = faces[cur].BoundBox
+                for j in small_cands:
+                    if j in used:
+                        continue
+                    jbb = faces[j].BoundBox
+                    if (cbb.XMin - gap <= jbb.XMax and jbb.XMin <= cbb.XMax + gap
+                            and cbb.YMin - gap <= jbb.YMax
+                            and jbb.YMin <= cbb.YMax + gap):
+                        used.add(j)
+                        cluster.append(j)
+                        queue.append(j)
+            clusters.append(cluster)
+
+        # 把小簇邻近的「大块亮面」也一起拉进来(如云图标的外轮廓面 0.2mm^2)
+        expand_candidates = []
+        for i, f in enumerate(faces):
+            if i in small_cands:
+                continue
+            c = colors[i]
+            if ckey(c) == body_color:
+                continue
+            if min(c) < 0.7:
+                continue
+            if f.Area > 0.5:
+                continue
+            if f.BoundBox.ZLength > 0.05:
+                continue
+            if f.BoundBox.ZMax < z_top:
+                continue
+            if not in_footprint(i):
+                continue
+            expand_candidates.append(i)
+
+        for cluster in clusters:
+            if len(cluster) < 15:            # 1 脚标记通常 <10 面；水印/型号字簇大得多
+                continue
+            tot = sum(faces[i].Area for i in cluster)
+            if tot < 0.01:
+                continue
+            # 估算簇的 XY 包围盒
+            xs = [faces[i].BoundBox.XMin for i in cluster] + \
+                 [faces[i].BoundBox.XMax for i in cluster]
+            ys = [faces[i].BoundBox.YMin for i in cluster] + \
+                 [faces[i].BoundBox.YMax for i in cluster]
+            zone = [min(xs) - 0.3, max(xs) + 0.3, min(ys) - 0.3, max(ys) + 0.3]
+            for i in expand_candidates:
+                if i in cluster:
+                    continue
+                fb = faces[i].BoundBox
+                if (zone[0] <= fb.XMax and fb.XMin <= zone[1]
+                        and zone[2] <= fb.YMax and fb.YMin <= zone[3]):
+                    cluster.append(i)
+                    tot += faces[i].Area
+
+            for i in cluster:
+                new_cols[i] = (body_color[0], body_color[1], body_color[2], 1.0)
+            hits_total += len(cluster)
+            print("[INFO] 全局抹掉水印 %d 面 (颜色 -> 本体 %.2f,%.2f,%.2f, 面积 %.3f mm^2, bbox x%.2f..%.2f y%.2f..%.2f)"
+                  % (len(cluster), body_color[0], body_color[1], body_color[2],
+                     tot, min(xs), max(xs), min(ys), max(ys)))
+
+    # ------------------------------------------------------------------
+    # 2) 局部薄层兜底（处理 R2512 等扁平器件）
+    # ------------------------------------------------------------------
+    for which in ("top", "bottom"):
+        near, win = [], []
         for i, f in enumerate(faces):
             fb = f.BoundBox
-            col = colors[i]
-            if tuple(round(x, 3) for x in col[:3]) == body:
+            if fb.ZLength > 0.03:            # 侧面/贯穿面不参与
                 continue
-            if min(col[0], col[1], col[2]) < 0.6:
+            d_out = (bb.ZMax - fb.ZMax) if which == "top" else (fb.ZMin - bb.ZMin)
+            if d_out < -0.0015:              # 超出参考面(异常)，跳过
                 continue
-            if (fb.ZMin >= slab - 0.03 and fb.ZMax <= slab + 0.0015
-                    and fb.ZMin < slab - 1e-4):
-                cand.append(i)
-        # XY 分块: 相邻(间隙<=0.03mm)的并成一块
-        boxes = []
-        for i in cand:
-            fb = faces[i].BoundBox
-            boxes.append([fb.XMin - 0.015, fb.XMax + 0.015,
-                          fb.YMin - 0.015, fb.YMax + 0.015, [i]])
-        merged = True
-        while merged:
-            merged = False
-            for a in range(len(boxes)):
-                for b in range(a + 1, len(boxes)):
-                    A, B = boxes[a], boxes[b]
-                    if (A[0] <= B[1] and B[0] <= A[1]
-                            and A[2] <= B[3] and B[2] <= A[3]):
-                        A[0], A[1] = min(A[0], B[0]), max(A[1], B[1])
-                        A[2], A[3] = min(A[2], B[2]), max(A[3], B[3])
-                        A[4].extend(B[4])
-                        boxes.pop(b)
-                        merged = True
-                        break
-                if merged:
-                    break
-        if len(boxes) < 4:          # 单片特征(如 1 脚标记)不动
-            break
-        for bx in boxes:
-            hits.extend(bx[4])
-        break
+            if d_out <= 0.002:
+                near.append(i)
+            if d_out <= 0.03:
+                win.append(i)
+        if not near or not win:
+            continue
 
-    if not hits:
-        return colors, 0
-    new_cols = list(colors)
-    bc = (body[0], body[1], body[2], 1.0)
-    for i in hits:
-        new_cols[i] = bc
-    print("[INFO] 抹掉本体刻字 %d 面 (本体色 %.2f,%.2f,%.2f)"
-          % (len(hits), body[0], body[1], body[2]))
-    return new_cols, len(hits)
+        # 该层主色 = 最外 2µm 内面积最大的颜色
+        area_by_col = {}
+        for i in near:
+            c = ckey(colors[i])
+            area_by_col[c] = area_by_col.get(c, 0.0) + faces[i].Area
+        surface = max(area_by_col.items(), key=lambda kv: kv[1])
+        surf_color, surf_area = surface[0], surface[1]
+        if surf_area <= 0:
+            continue
+
+        # 第一轮: 「文字碎面」= 与表层主色不同、且面积很小的表层碎片
+        by_col = {}
+        for i in win:
+            if ckey(colors[i]) == surf_color:
+                continue
+            if faces[i].Area > 0.05:
+                continue
+            by_col.setdefault(ckey(colors[i]), []).append(i)
+
+        for c, idx in sorted(by_col.items(), key=lambda kv: -len(kv[1])):
+            if len(idx) < 5:                 # 单片特征(如 1 脚标记)不动
+                continue
+            tot = sum(faces[i].Area for i in idx)
+            if tot > 0.25 * surf_area:
+                continue
+            boxes = []
+            for i in idx:
+                fb = faces[i].BoundBox
+                boxes.append([fb.XMin, fb.XMax, fb.YMin, fb.YMax])
+            nb = count_blocks(boxes)
+            if nb < 3:                       # 单片/单块特征不动
+                continue
+
+            # 第二轮: 紧邻文字的同色大块也一起抹(logo 里的云图标就是一整块 0.08mm^2 的面)
+            grow = 0.6
+            zones = [[b[0] - grow, b[1] + grow, b[2] - grow, b[3] + grow]
+                     for b in boxes]
+            idx = list(idx)
+            for i in win:
+                if i in idx or ckey(colors[i]) != c:
+                    continue
+                fb = faces[i].BoundBox
+                if any(z[0] <= fb.XMax and fb.XMin <= z[1]
+                       and z[2] <= fb.YMax and fb.YMin <= z[3] for z in zones):
+                    idx.append(i)
+                    tot += faces[i].Area
+            if tot > 0.4 * surf_area:        # 长出太多 -> 判定失误，放弃
+                continue
+
+            for i in idx:
+                new_cols[i] = (surf_color[0], surf_color[1], surf_color[2], 1.0)
+            hits_total += len(idx)
+            print("[INFO] 抹掉%s面水印 %d 面 (颜色 %.2f,%.2f,%.2f -> 主色 %.2f,%.2f,%.2f, %d 块, 面积 %.3f/%.3f mm^2)"
+                  % ("顶" if which == "top" else "底", len(idx),
+                     c[0], c[1], c[2], surf_color[0], surf_color[1], surf_color[2],
+                     nb, tot, surf_area))
+    return new_cols, hits_total
 
 
 def dedupe(cands):
@@ -218,8 +410,8 @@ def extract_with_color():
 
     # 去掉嘉立创 EDA 的 LCEDA/EasyEDA 水印 logo (独立零体积白色贴片)
     shape, colors, n_logo = strip_logo_decals(feat.Shape.copy(), list(colors))
-    # 抹掉刻在本体表面的型号字(SOIC16 之类)
-    colors, n_text = strip_engraved_text(shape, colors)
+    # 抹掉贴/刻在本体最外表面上的水印字与型号字(如 SOIC16 / R2512 / PDIP 上的 LCEDA logo)
+    colors, n_text = strip_surface_marks(shape, colors)
 
     # 居中 (只平移，面顺序不变 → 颜色仍一一对应)
     bb = shape.BoundBox
@@ -248,8 +440,8 @@ def extract_with_color():
         return False
 
     bb2 = shape.BoundBox
-    print("[OK] %s | %d faces | colors=%s | logo_stripped=%d | %.3f x %.3f x %.3f | vol %.4f mm^3"
-          % (feat.Label, n_faces, "yes" if colored else "no", n_logo,
+    print("[OK] %s | %d faces | colors=%s | logo_stripped=%d | mark_faces=%d | %.3f x %.3f x %.3f | vol %.4f mm^3"
+          % (feat.Label, n_faces, "yes" if colored else "no", n_logo, n_text,
              bb2.XLength, bb2.YLength, bb2.ZLength,
              sum(s.Volume for s in shape.Solids)))
     print("[OK] saved -> %s" % out)
