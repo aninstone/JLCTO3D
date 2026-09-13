@@ -1,0 +1,10 @@
+# Normalize to LF in the repo, but keep Windows launchers as CRLF on checkout
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.step -text
+*.stp  -text
+*.png  -text

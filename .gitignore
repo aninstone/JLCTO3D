@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# JLCTO3D output / scratch
+*_package.step
+*_package.stp
+*_preview.png
+_step_tmp/
