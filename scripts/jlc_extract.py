@@ -51,8 +51,9 @@ def strip_logo_decals(shape, colors):
     这类标记在 STEP 里既不是 "silkscreen" 对象、也不在器件本体上，而是被拆成
     若干「独立的零体积平面装饰块」贴在器件外壳表面(典型 13 片: 图标 + 2 行字)。
     判据(同时满足):
-      * 厚度 ≈ 0 (Z 向 ≤ 0.02mm) 且 体积 ≈ 0 (≤ 0.02 mm^3) —— 纯平面贴片
-      * 该 solid 的所有面颜色都很亮(每通道 >= 0.8) —— 白色丝印
+      * 厚度 ≈ 0 (包围盒最小维 ≤ 0.02mm，不限朝向——水平/竖直贴片都算)
+        且 体积 ≈ 0 (≤ 0.02 mm^3) —— 纯平面贴片
+      * 该 solid 所有面颜色统一(单色 logo；白字/黑字/任意色都算)
       * 这样的 solid 至少 2 片 —— 字样一定是多片，单片的(如 1 脚标记)不动
     返回 (新shape, 新颜色列表, 删除片数)；无命中时原样返回。
     """
@@ -72,10 +73,12 @@ def strip_logo_decals(shape, colors):
         fcols = list(colors[cursor:cursor + n])
         cursor += n
         bb = s.BoundBox
-        flat = (bb.ZLength <= 0.02) and (s.Volume <= 0.02)
-        bright = bool(fcols) and all(
-            min(c[0], c[1], c[2]) >= 0.8 for c in fcols)
-        if flat and bright:
+        thin = min(bb.XLength, bb.YLength, bb.ZLength)
+        flat = (thin <= 0.02) and (s.Volume <= 0.02)
+        mono = bool(fcols) and all(
+            max(abs(c[0] - fcols[0][0]), abs(c[1] - fcols[0][1]),
+                abs(c[2] - fcols[0][2])) < 0.05 for c in fcols)
+        if flat and mono:
             dropped_labels.append(
                 "S%d(x%.2f..%.2f,y%.2f..%.2f,z%.2f..%.2f,%d面)"
                 % (si, bb.XMin, bb.XMax, bb.YMin, bb.YMax, bb.ZMin, bb.ZMax, n))
@@ -354,6 +357,100 @@ def strip_surface_marks(shape, colors):
                   % ("顶" if which == "top" else "底", len(idx),
                      c[0], c[1], c[2], surf_color[0], surf_color[1], surf_color[2],
                      nb, tot, surf_area))
+
+    # ------------------------------------------------------------------
+    # 3) 斜面/侧面上的印刷水印: 与「大块本体色面」几乎共面的小碎面簇
+    #    (水印字符面与所在外表面共面或略浮出 <=0.1mm, 颜色不同; 不限朝向)
+    # ------------------------------------------------------------------
+    def _canon_normal(sf):
+        ax = sf.Axis
+        v = (ax.x, ax.y, ax.z)
+        for comp in v:
+            if abs(comp) > 1e-6:
+                if comp < 0:
+                    v = (-v[0], -v[1], -v[2])
+                break
+        return (round(v[0], 3), round(v[1], 3), round(v[2], 3))
+
+    big_by_n = {}
+    for i, f in enumerate(faces):
+        if f.Area < 0.5 or ckey(colors[i]) != body_color:
+            continue
+        try:
+            if not isinstance(f.Surface, Part.Plane):
+                continue
+        except Exception:
+            continue
+        big_by_n.setdefault(_canon_normal(f.Surface), []).append(i)
+
+    small_c3 = []
+    for i, f in enumerate(faces):
+        if f.Area > 0.05 or ckey(colors[i]) == body_color:
+            continue
+        try:
+            if not isinstance(f.Surface, Part.Plane):
+                continue
+        except Exception:
+            continue
+        sf = f.Surface
+        nkey = _canon_normal(sf)
+        if nkey not in big_by_n:
+            continue
+        pos = sf.Position
+        fb = f.BoundBox
+        cx = (fb.XMin + fb.XMax) * 0.5
+        cy = (fb.YMin + fb.YMax) * 0.5
+        cz = (fb.ZMin + fb.ZMax) * 0.5
+        for j in big_by_n[nkey]:
+            bj = faces[j].Surface
+            off = ((pos.x - bj.Position.x) * nkey[0] +
+                   (pos.y - bj.Position.y) * nkey[1] +
+                   (pos.z - bj.Position.z) * nkey[2])
+            if abs(off) > 0.1:
+                continue
+            bjb = faces[j].BoundBox
+            if (bjb.XMin - 0.05 <= cx <= bjb.XMax + 0.05 and
+                    bjb.YMin - 0.05 <= cy <= bjb.YMax + 0.05 and
+                    bjb.ZMin - 0.05 <= cz <= bjb.ZMax + 0.05):
+                small_c3.append(i)
+                break
+
+    if len(small_c3) >= 5:
+        gap = 0.25
+        used = set()
+        clusters = []
+        for i in small_c3:
+            if i in used:
+                continue
+            cluster = [i]
+            used.add(i)
+            queue = [i]
+            while queue:
+                cur = queue.pop(0)
+                cbb = faces[cur].BoundBox
+                for j in small_c3:
+                    if j in used:
+                        continue
+                    jbb = faces[j].BoundBox
+                    if (cbb.XMin - gap <= jbb.XMax and jbb.XMin <= cbb.XMax + gap
+                            and cbb.YMin - gap <= jbb.YMax and jbb.YMin <= cbb.YMax + gap
+                            and cbb.ZMin - gap <= jbb.ZMax and jbb.ZMin <= cbb.ZMax + gap):
+                        used.add(j)
+                        cluster.append(j)
+                        queue.append(j)
+            clusters.append(cluster)
+
+        for cluster in clusters:
+            if len(cluster) < 10:            # 1 脚标记/小特征远少于此
+                continue
+            tot = sum(faces[i].Area for i in cluster)
+            if tot < 0.005 or tot > 2.0:
+                continue
+            for i in cluster:
+                new_cols[i] = (body_color[0], body_color[1], body_color[2], 1.0)
+            hits_total += len(cluster)
+            print("[INFO] 抹掉斜面印刷水印 %d 面 (颜色 -> 本体 %.2f,%.2f,%.2f, 面积 %.3f mm^2)"
+                  % (len(cluster), body_color[0], body_color[1], body_color[2], tot))
     return new_cols, hits_total
 
 
@@ -376,6 +473,51 @@ def dedupe(cands):
 # ---------------------------------------------------------------------------
 # 带颜色提取 (首选)
 # ---------------------------------------------------------------------------
+def _sanitize_name(s):
+    return "".join(c if (c.isalnum() or c in "-_") else "_" for c in s).strip("_") or "Part"
+
+
+def _export_one_colored(feat, colors, out_path):
+    """单个器件: 去水印 -> 居中 -> 带色导出. 返回 True/False"""
+    import ImportGui  # 依赖 GUI 初始化完成后再导入
+    shape, colors, n_logo = strip_logo_decals(feat.Shape.copy(), list(colors))
+    # 抹掉贴/刻在本体最外表面上的水印字与型号字(如 SOIC16 / R2512 / PDIP 上的 LCEDA logo)
+    colors, n_text = strip_surface_marks(shape, colors)
+
+    # 居中 (只平移，面顺序不变 → 颜色仍一一对应)
+    bb = shape.BoundBox
+    shape.translate(FreeCAD.Vector(
+        -(bb.XMin + bb.XMax) / 2.0,
+        -(bb.YMin + bb.YMax) / 2.0,
+        -bb.ZMin,
+    ))
+
+    out_doc = FreeCAD.newDocument("jlc_out")
+    f2 = out_doc.addObject("Part::Feature", "Package")
+    f2.Shape = shape
+    out_doc.recompute()
+
+    n_faces = len(shape.Faces)
+    colored = False
+    if len(colors) == n_faces:
+        f2.ViewObject.DiffuseColor = list(colors)
+        colored = True
+    else:
+        print("[WARN] 面数/颜色数不一致 (%d vs %d)，本次不设色"
+              % (n_faces, len(colors)))
+
+    ImportGui.export([f2], out_path)
+    ok = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    if ok:
+        bb2 = shape.BoundBox
+        print("[OK] %s | %d faces | colors=%s | logo_stripped=%d | mark_faces=%d | %.3f x %.3f x %.3f | vol %.4f mm^3"
+              % (feat.Label, n_faces, "yes" if colored else "no", n_logo, n_text,
+                 bb2.XLength, bb2.YLength, bb2.ZLength,
+                 sum(s.Volume for s in shape.Solids)))
+        print("[OK] saved -> %s" % out_path)
+    return ok
+
+
 def extract_with_color():
     import FreeCADGui
     FreeCADGui.showMainWindow()          # 需要 ViewObject（offscreen 下不可见）
@@ -403,49 +545,29 @@ def extract_with_color():
         return False
 
     uniq = dedupe(cands)
+
+    # 多个不同器件: 每个单独导出到 <名字>_packages 文件夹
     if len(uniq) > 1:
-        print("[INFO] 识别出 %d 个不同器件，自动取最大者: %s"
-              % (len(uniq), uniq[0][1].Label))
+        folder = os.path.splitext(out)[0] + "_packages"
+        os.makedirs(folder, exist_ok=True)
+        print("[INFO] 识别出 %d 个不同器件, 分别导出到: %s" % (len(uniq), folder))
+        used = {}
+        ok_n = 0
+        for v, feat, colors in uniq:
+            name = _sanitize_name(feat.Label)
+            used[name] = used.get(name, 0) + 1
+            if used[name] > 1:
+                name = "%s_%d" % (name, used[name])
+            path = os.path.join(folder, name + "_package.step")
+            if _export_one_colored(feat, colors, path):
+                ok_n += 1
+        print("[SUMMARY] %d/%d 器件导出成功 -> %s" % (ok_n, len(uniq), folder))
+        return ok_n > 0
+
+    # 单个器件: 行为与旧版一致
     v, feat, colors = uniq[0]
-
-    # 去掉嘉立创 EDA 的 LCEDA/EasyEDA 水印 logo (独立零体积白色贴片)
-    shape, colors, n_logo = strip_logo_decals(feat.Shape.copy(), list(colors))
-    # 抹掉贴/刻在本体最外表面上的水印字与型号字(如 SOIC16 / R2512 / PDIP 上的 LCEDA logo)
-    colors, n_text = strip_surface_marks(shape, colors)
-
-    # 居中 (只平移，面顺序不变 → 颜色仍一一对应)
-    bb = shape.BoundBox
-    shape.translate(FreeCAD.Vector(
-        -(bb.XMin + bb.XMax) / 2.0,
-        -(bb.YMin + bb.YMax) / 2.0,
-        -bb.ZMin,
-    ))
-
-    out_doc = FreeCAD.newDocument("jlc_out")
-    f2 = out_doc.addObject("Part::Feature", "Package")
-    f2.Shape = shape
-    out_doc.recompute()
-
-    n_faces = len(shape.Faces)
-    if len(colors) == n_faces:
-        f2.ViewObject.DiffuseColor = list(colors)
-        colored = True
-    else:
-        print("[WARN] 面数/颜色数不一致 (%d vs %d)，本次不设色"
-              % (n_faces, len(colors)))
-        colored = False
-
-    ImportGui.export([f2], out)
-    if not os.path.exists(out) or os.path.getsize(out) == 0:
-        return False
-
-    bb2 = shape.BoundBox
-    print("[OK] %s | %d faces | colors=%s | logo_stripped=%d | mark_faces=%d | %.3f x %.3f x %.3f | vol %.4f mm^3"
-          % (feat.Label, n_faces, "yes" if colored else "no", n_logo, n_text,
-             bb2.XLength, bb2.YLength, bb2.ZLength,
-             sum(s.Volume for s in shape.Solids)))
-    print("[OK] saved -> %s" % out)
-    return True
+    print("[INFO] 识别到单个器件: %s" % feat.Label)
+    return _export_one_colored(feat, colors, out)
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +590,36 @@ def extract_plain():
         return False
 
     uniq = dedupe(cands)
+    if len(uniq) > 1:
+        # 多器件: 每个单独导出(无颜色兜底)
+        folder = os.path.splitext(out)[0] + "_packages"
+        os.makedirs(folder, exist_ok=True)
+        print("[INFO] 识别出 %d 个不同器件, 分别导出到: %s" % (len(uniq), folder))
+        used = {}
+        ok_n = 0
+        for v, o, _c in uniq:
+            solids = [s for s in o.Shape.Solids if s.Volume > 0.001]
+            if not solids:
+                continue
+            comp = Part.Compound(solids)
+            bb = comp.BoundBox
+            comp.translate(FreeCAD.Vector(
+                -(bb.XMin + bb.XMax) / 2.0,
+                -(bb.YMin + bb.YMax) / 2.0,
+                -bb.ZMin,
+            ))
+            name = _sanitize_name(o.Label)
+            used[name] = used.get(name, 0) + 1
+            if used[name] > 1:
+                name = "%s_%d" % (name, used[name])
+            path = os.path.join(folder, name + "_package.step")
+            comp.exportStep(path)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                ok_n += 1
+                print("[OK] %s | %d solids | saved -> %s" % (o.Label, len(solids), path))
+        print("[SUMMARY] %d/%d 器件导出成功 -> %s" % (ok_n, len(uniq), folder))
+        return ok_n > 0
+
     tgt = uniq[0][1]
     solids = [s for s in tgt.Shape.Solids if s.Volume > 0.001]
     if not solids:
