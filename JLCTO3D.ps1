@@ -124,18 +124,15 @@ foreach ($cand in @($env:JLCTO3D_SW_PY, "C:/Users/Simon/.workbuddy/binaries/pyth
     }
 }
 if ($pyWin -and (Test-Path $conv)) {
-    $swTarget = $null
-    # Prefer $out ONLY if this run actually (re)generated it; multi-component
-    # exports leave $out stale from an older single-component run.
-    if ((Test-Path $out) -and ((Get-Item $out).LastWriteTime -ge $startAt)) {
-        $swTarget = $out
-    } elseif (Test-Path $folder) {
-        $swTarget = $folder
-    } elseif (Test-Path $out) {
-        $swTarget = $out
-    }
-    Log "SLDPRT target: $swTarget"
-    if ($swTarget) {
+    # Convert EVERYTHING that exists: the single _package.step (if present)
+    # AND the _packages folder (if present). batch_step_to_sldprt.py skips
+    # files whose SLDPRT already exists, so this is idempotent and there is
+    # no target-selection decision left to get wrong.
+    $targets = @()
+    if (Test-Path $folder) { $targets += $folder }
+    if (Test-Path $out)    { $targets += $out }
+    foreach ($swTarget in $targets) {
+        Log "SLDPRT target: $swTarget"
         try {
             $outLine = & $pyWin $conv $swTarget 2>&1
             Log ($outLine | Out-String)
